@@ -7,15 +7,10 @@ on:
         description: 'Command to run on all servers'
         required: true
         default: 'hostname && uptime'
-      debug:
-        description: 'Show verbose logs'
-        required: false
-        default: false
-        type: boolean
 
 permissions:
-  contents: write   # push status report
-  actions: write    # delete old workflow runs
+  contents: write
+  actions: write
 
 jobs:
   get-servers:
@@ -29,25 +24,18 @@ jobs:
         id: fetch
         run: |
           MATRIX_BATCHES=10
-
           RESPONSE=$(curl -s -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
-            "$COOLIFY_API_URL/servers")
-
+            "$COOLIFY_API_URL/servers" 2>/dev/null)
           SERVERS_JSON=$(echo "$RESPONSE" | jq -c '[.[].ip]')
           SERVER_COUNT=$(echo "$SERVERS_JSON" | jq 'length')
-
           if [ "$SERVER_COUNT" -eq 0 ]; then
-            echo "::warning::No servers returned by API."
             SERVERS_JSON='[]'
             SERVER_COUNT=0
           fi
-
           BATCH_LIST=$(seq 0 $((MATRIX_BATCHES - 1)) | jq -c -s '.')
-
           echo "servers_json=$SERVERS_JSON" >> $GITHUB_OUTPUT
           echo "server_count=$SERVER_COUNT" >> $GITHUB_OUTPUT
           echo "batch_list=$BATCH_LIST" >> $GITHUB_OUTPUT
-          echo "Found $SERVER_COUNT servers, running $MATRIX_BATCHES parallel batches"
         env:
           COOLIFY_API_URL: ${{ secrets.COOLIFY_API_URL }}
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
@@ -60,9 +48,6 @@ jobs:
         batch: ${{ fromJSON(needs.get-servers.outputs.batch_list) }}
       fail-fast: false
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -79,237 +64,32 @@ jobs:
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Install dependencies
+      - name: Execute command
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq
-
-      - name: Execute command on servers
-        run: |
+          sudo apt-get install -y -qq jq >/dev/null 2>&1
           MATRIX_BATCHES=10
           BATCH_SIZE=$(( (SERVER_COUNT + MATRIX_BATCHES - 1) / MATRIX_BATCHES ))
           START=$((MATRIX_BATCH * BATCH_SIZE))
           END=$((START + BATCH_SIZE))
-
-          SERVERS=$(echo "$SERVERS_JSON" | jq -r '.[]' | \
-            sed -n "$((START+1)),${END}p")
-
-          if [ -z "$SERVERS" ]; then
-            echo "No servers in this batch"
-            exit 0
-          fi
-
-          echo "Running command on: $SERVERS"
-
+          SERVERS=$(echo "$SERVERS_JSON" | jq -r '.[]' | sed -n "$((START+1)),${END}p")
+          [ -z "$SERVERS" ] && exit 0
           BATCH=${{ matrix.batch }}
-
-          cat > run_cmd.sh << 'SCRIPT'
-          #!/bin/bash
-          SERVER_IP=$1
-          RESULTS_FILE="/tmp/cmd_results_${BATCH_NUM}.txt"
-          OUTPUT_FILE="/tmp/cmd_output_${BATCH_NUM}_${SERVER_IP}.txt"
-
-          echo "=== $SERVER_IP ===" > "$OUTPUT_FILE"
-
-          if timeout 60 ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 \
-            -o ServerAliveCountMax=3 \
-            -i ~/.ssh/id_ed25519 "root@$SERVER_IP" \
-            "$SHELL_CMD" >> "$OUTPUT_FILE" 2>&1; then
-            RC=$?
-            echo "OK|$SERVER_IP|exit=$RC" >> "$RESULTS_FILE"
-          else
-            RC=$?
-            echo "FAIL|$SERVER_IP|exit=$RC" >> "$RESULTS_FILE"
-          fi
-
-          cat "$OUTPUT_FILE"
-          echo ""
-          SCRIPT
-          chmod +x run_cmd.sh
-
-          echo "$SERVERS" | xargs -P 10 -I {} bash run_cmd.sh {} || true
+          for SERVER_IP in $SERVERS; do
+            timeout 60 ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 \
+              -o ServerAliveCountMax=3 \
+              -i ~/.ssh/id_ed25519 "root@$SERVER_IP" \
+              "$SHELL_CMD" > /dev/null 2>&1 || true
+          done
         env:
           SERVERS_JSON: ${{ needs.get-servers.outputs.servers_json }}
           SERVER_COUNT: ${{ needs.get-servers.outputs.server_count }}
           SHELL_CMD: ${{ inputs.command }}
-          BATCH_NUM: ${{ matrix.batch }}
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Emit batch results JSON
-        id: results
-        if: always()
-        run: |
-          BATCH=${{ matrix.batch }}
-          RESULTS_FILE="/tmp/cmd_results_${BATCH}.txt"
-          TOTAL=0; OK=0; FAIL=0
-          RESULTS_JSON='[]'
-
-          if [ -f "$RESULTS_FILE" ]; then
-            TOTAL=$(wc -l < "$RESULTS_FILE")
-            OK=$(grep -c '^OK|' "$RESULTS_FILE" || true)
-            FAIL=$(grep -c '^FAIL|' "$RESULTS_FILE" || true)
-
-            while IFS='|' read -r status host reason; do
-              RESULTS_JSON=$(echo "$RESULTS_JSON" | jq -c \
-                --arg s "$status" --arg h "$host" --arg r "$reason" \
-                '. + [{"status":$s,"host":$h,"detail":$r}]')
-            done < "$RESULTS_FILE"
-          fi
-
-          JSON=$(printf '{"batch":%d,"total":%d,"ok":%d,"fail":%d,"results":%s}' \
-            "$BATCH" "$TOTAL" "$OK" "$FAIL" "$RESULTS_JSON")
-
-          mkdir -p /tmp/batch_results
-          echo "$JSON" > "/tmp/batch_results/batch_${BATCH}.json"
-
-          # Also save outputs per server
-          mkdir -p /tmp/server_outputs
-          for f in /tmp/cmd_output_${BATCH}_*.txt; do
-            [ -f "$f" ] && cp "$f" /tmp/server_outputs/
-          done
-        env:
-          BATCH_NUM: ${{ matrix.batch }}
-
-      - name: Upload batch results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cmd-results-${{ matrix.batch }}
-          path: |
-            /tmp/batch_results/batch_*.json
-            /tmp/server_outputs/*.txt
-          retention-days: 7
-          if-no-files-found: ignore
-
-  report:
+  cleanup:
     needs: [get-servers, execute]
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Switch to status branch
-        run: |
-          git fetch origin status 2>/dev/null || true
-          if git rev-parse --verify origin/status >/dev/null 2>&1; then
-            git checkout -B status origin/status
-          else
-            git checkout --orphan status
-            git rm -rf . 2>/dev/null || true
-          fi
-
-      - name: Download all batch results
-        if: always()
-        uses: actions/download-artifact@v4
-        with:
-          pattern: cmd-results-*
-          path: /tmp/all_results
-          merge-multiple: true
-
-      - name: Aggregate & write status report
-        run: |
-          mkdir -p status
-
-          if ls /tmp/all_results/batch_*.json >/dev/null 2>&1; then
-            jq -s -c '.' /tmp/all_results/batch_*.json > /tmp/all_batches.json
-          else
-            echo '[]' > /tmp/all_batches.json
-          fi
-
-          # Collect all server outputs
-          OUTPUTS_MD=""
-          for f in /tmp/all_results/cmd_output_*.txt; do
-            [ -f "$f" ] || continue
-            OUTPUTS_MD="${OUTPUTS_MD}\n$(cat "$f")\n---\n"
-          done
-
-          BATCH_COUNT=$(jq 'length' /tmp/all_batches.json)
-          TOTAL=$(jq '[.[].total] | add // 0' /tmp/all_batches.json)
-          OK=$(jq '[.[].ok] | add // 0' /tmp/all_batches.json)
-          FAIL=$(jq '[.[].fail] | add // 0' /tmp/all_batches.json)
-
-          RESULTS_ARR=$(jq -c '[.[].results[]?]' /tmp/all_batches.json)
-          FAILED_TABLE=$(echo "$RESULTS_ARR" | jq -r \
-            '.[] | select(.status=="FAIL") | "| \(.host) | \(.detail) |"')
-          [ -z "$FAILED_TABLE" ] && FAILED_TABLE="| - | None |"
-
-          RESULTS_TABLE=$(echo "$RESULTS_ARR" | jq -r \
-            '.[] | "| \(.host) | \(.status) | \(.detail) |"')
-
-          STARTED="${{ github.run_started_at }}"
-          [ -z "$STARTED" ] || [ "$STARTED" = "null" ] && STARTED="unknown"
-          START_EPOCH=$(date -d "$STARTED" +%s 2>/dev/null || echo 0)
-          NOW_EPOCH=$(date +%s)
-          DUR=$((NOW_EPOCH - START_EPOCH))
-          DUR_TXT=$(printf "%dm %02ds" $((DUR/60)) $((DUR%60)))
-
-          if [ "$FAIL" -eq 0 ]; then
-            RESULT="SUCCESS"; RESULT_ICON=":white_check_mark:"
-          else
-            RESULT="PARTIAL"; RESULT_ICON=":warning:"
-          fi
-
-          cat > status/latest.md << EOF
-          # Coolify Remote Command - Status Report
-
-          | | |
-          |---|---|
-          | **Run** | #${{ github.run_number }} (id \`${{ github.run_id }}\`) |
-          | **Trigger** | manual (workflow_dispatch) |
-          | **Command** | \`${{ inputs.command }}\` |
-          | **Started** | $STARTED |
-          | **Duration** | $DUR_TXT |
-          | **Result** | $RESULT_ICON $RESULT |
-
-          ## Summary
-
-          - **Servers**: $TOTAL (in $BATCH_COUNT batch(es))
-          - **Success**: $OK
-          - **Failed**: $FAIL
-
-          ## Results
-
-          | Host | Status | Detail |
-          |---|---|---|
-          $RESULTS_TABLE
-
-          ## Failed hosts
-
-          | Host | Detail |
-          |---|---|
-          $FAILED_TABLE
-
-          ## Output
-
-          <details>
-          <summary>Click to expand full output</summary>
-
-          \`\`\`
-          $OUTPUTS_MD
-          \`\`\`
-
-          </details>
-          EOF
-
-      - name: Commit & push status branch
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add status/
-          if git diff --cached --quiet; then
-            echo "No status changes"
-          else
-            git commit -m "status: run #${{ github.run_number }} (${{ github.run_id }})"
-            git push origin status 2>/dev/null || {
-              git fetch origin status
-              git rebase origin/status
-              git push origin status
-            }
-          fi
-        env:
-          GH_TOKEN: ${{ github.token }}
-
       - name: Clean old workflow runs (keep latest 5)
         run: |
           KEEP=5
@@ -326,6 +106,5 @@ jobs:
             fi
             gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id" 2>/dev/null || true
           done < /tmp/runs.tsv
-          echo "History cleanup done"
         env:
           GH_TOKEN: ${{ github.token }}
