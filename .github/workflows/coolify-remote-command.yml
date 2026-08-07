@@ -101,19 +101,20 @@ jobs:
 
           echo "Running command on: $SERVERS"
 
+          BATCH=${{ matrix.batch }}
+
           cat > run_cmd.sh << 'SCRIPT'
           #!/bin/bash
           SERVER_IP=$1
-          CMD="$2"
-          RESULTS_FILE="/tmp/cmd_results_${BATCH}.txt"
-          OUTPUT_FILE="/tmp/cmd_output_${BATCH}_${SERVER_IP}.txt"
+          RESULTS_FILE="/tmp/cmd_results_${BATCH_NUM}.txt"
+          OUTPUT_FILE="/tmp/cmd_output_${BATCH_NUM}_${SERVER_IP}.txt"
 
           echo "=== $SERVER_IP ===" > "$OUTPUT_FILE"
 
           if timeout 60 ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 \
             -o ServerAliveCountMax=3 \
             -i ~/.ssh/id_ed25519 "root@$SERVER_IP" \
-            "$CMD" >> "$OUTPUT_FILE" 2>&1; then
+            "$SHELL_CMD" >> "$OUTPUT_FILE" 2>&1; then
             RC=$?
             echo "OK|$SERVER_IP|exit=$RC" >> "$RESULTS_FILE"
           else
@@ -123,16 +124,15 @@ jobs:
 
           cat "$OUTPUT_FILE"
           echo ""
-          exit 0
           SCRIPT
           chmod +x run_cmd.sh
 
-          BATCH=${{ matrix.batch }}
-          echo "$SERVERS" | xargs -P 10 -I {} bash run_cmd.sh {} "$COMMAND" || true
+          echo "$SERVERS" | xargs -P 10 -I {} bash run_cmd.sh {} || true
         env:
           SERVERS_JSON: ${{ needs.get-servers.outputs.servers_json }}
           SERVER_COUNT: ${{ needs.get-servers.outputs.server_count }}
-          COMMAND: ${{ inputs.command }}
+          SHELL_CMD: ${{ inputs.command }}
+          BATCH_NUM: ${{ matrix.batch }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - name: Emit batch results JSON
@@ -291,29 +291,6 @@ jobs:
 
           </details>
           EOF
-
-          # Append to history
-          {
-            echo
-            echo "## Run #${{ github.run_number }} - $STARTED - $RESULT - $DUR_TXT - $OK/$TOTAL OK"
-            echo "**Command:** \`${{ inputs.command }}\`"
-            if [ "$FAIL" -gt 0 ]; then
-              echo "Failed: $(echo "$RESULTS_ARR" | jq -r '[.[] | select(.status=="FAIL") | "\(.host) (\(.detail))"] | join(", ")')"
-            fi
-          } > /tmp/history_block.md
-
-          if [ -f status/history.md ]; then
-            {
-              echo "# Coolify Remote Command - History"
-              echo
-              cat /tmp/history_block.md
-              grep -v '^# Coolify Remote Command - History' status/history.md | sed '/./,$!d'
-            } > /tmp/history_new.md
-            mv /tmp/history_new.md status/history.md
-          else
-            echo "# Coolify Remote Command - History" > status/history.md
-            cat /tmp/history_block.md >> status/history.md
-          fi
 
       - name: Commit & push status branch
         run: |
