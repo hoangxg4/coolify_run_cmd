@@ -16,7 +16,6 @@ jobs:
   get-servers:
     runs-on: ubuntu-latest
     outputs:
-      servers_json: ${{ steps.fetch.outputs.servers_json }}
       server_count: ${{ steps.fetch.outputs.server_count }}
       batch_list: ${{ steps.fetch.outputs.batch_list }}
     steps:
@@ -64,11 +63,6 @@ jobs:
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Mask sensitive values
-        run: |
-          echo "::add-mask::${{ needs.get-servers.outputs.servers_json }}"
-          echo "::add-mask::${{ inputs.command }}"
-
       - name: Execute command
         run: |
           sudo apt-get install -y -qq jq >/dev/null 2>&1
@@ -76,6 +70,8 @@ jobs:
           BATCH_SIZE=$(( (SERVER_COUNT + MATRIX_BATCHES - 1) / MATRIX_BATCHES ))
           START=$((BATCH * BATCH_SIZE))
           END=$((START + BATCH_SIZE))
+          SERVERS_JSON=$(curl -s -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+            "$COOLIFY_API_URL/servers" 2>/dev/null | jq -c '[.[].ip]')
           SERVERS=$(echo "$SERVERS_JSON" | jq -r '.[]' | sed -n "$((START+1)),${END}p")
           [ -z "$SERVERS" ] && exit 0
           for SERVER_IP in $SERVERS; do
@@ -85,7 +81,8 @@ jobs:
               "$SHELL_CMD" > /dev/null 2>&1 || true
           done
         env:
-          SERVERS_JSON: ${{ needs.get-servers.outputs.servers_json }}
+          COOLIFY_API_URL: ${{ secrets.COOLIFY_API_URL }}
+          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
           SERVER_COUNT: ${{ needs.get-servers.outputs.server_count }}
           SHELL_CMD: ${{ inputs.command }}
           BATCH: ${{ matrix.batch }}
