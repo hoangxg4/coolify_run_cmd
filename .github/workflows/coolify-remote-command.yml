@@ -69,11 +69,10 @@ jobs:
           sudo apt-get install -y -qq jq >/dev/null 2>&1
           MATRIX_BATCHES=10
           BATCH_SIZE=$(( (SERVER_COUNT + MATRIX_BATCHES - 1) / MATRIX_BATCHES ))
-          START=$((MATRIX_BATCH * BATCH_SIZE))
+          START=$((BATCH * BATCH_SIZE))
           END=$((START + BATCH_SIZE))
           SERVERS=$(echo "$SERVERS_JSON" | jq -r '.[]' | sed -n "$((START+1)),${END}p")
           [ -z "$SERVERS" ] && exit 0
-          BATCH=${{ matrix.batch }}
           for SERVER_IP in $SERVERS; do
             timeout 60 ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 \
               -o ServerAliveCountMax=3 \
@@ -84,6 +83,7 @@ jobs:
           SERVERS_JSON: ${{ needs.get-servers.outputs.servers_json }}
           SERVER_COUNT: ${{ needs.get-servers.outputs.server_count }}
           SHELL_CMD: ${{ inputs.command }}
+          BATCH: ${{ matrix.batch }}
 
   cleanup:
     needs: [get-servers, execute]
