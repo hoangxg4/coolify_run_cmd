@@ -64,6 +64,11 @@ jobs:
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
+      - name: Mask sensitive values
+        run: |
+          echo "::add-mask::${{ needs.get-servers.outputs.servers_json }}"
+          echo "::add-mask::${{ inputs.command }}"
+
       - name: Execute command
         run: |
           sudo apt-get install -y -qq jq >/dev/null 2>&1
@@ -92,9 +97,11 @@ jobs:
     steps:
       - name: Clean old workflow runs (keep latest 5)
         run: |
+          set -euo pipefail
           KEEP=5
           CURRENT="${{ github.run_id }}"
-          gh run list --limit 200 --json databaseId,status,createdAt \
+          gh run list --workflow=coolify-remote-command.yml --limit 200 \
+            --json databaseId,status,createdAt \
             | jq -r '.[] | select(.status=="completed") | [.createdAt,.databaseId] | @tsv' \
             | sort -r > /tmp/runs.tsv
           KEPT=0
@@ -104,7 +111,10 @@ jobs:
               KEPT=$((KEPT+1))
               continue
             fi
-            gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id" 2>/dev/null || true
+            echo "Deleting run $id (created $created)"
+            gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id"
           done < /tmp/runs.tsv
+          echo "Cleanup done: kept $KEPT completed runs"
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
