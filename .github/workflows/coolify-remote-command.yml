@@ -13,38 +13,11 @@ permissions:
   actions: write
 
 jobs:
-  get-servers:
-    runs-on: ubuntu-latest
-    outputs:
-      server_count: ${{ steps.fetch.outputs.server_count }}
-      batch_list: ${{ steps.fetch.outputs.batch_list }}
-    steps:
-      - name: Fetch server list from Coolify API
-        id: fetch
-        run: |
-          MATRIX_BATCHES=10
-          RESPONSE=$(curl -s -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
-            "$COOLIFY_API_URL/servers" 2>/dev/null)
-          SERVERS_JSON=$(echo "$RESPONSE" | jq -c '[.[].ip]')
-          SERVER_COUNT=$(echo "$SERVERS_JSON" | jq 'length')
-          if [ "$SERVER_COUNT" -eq 0 ]; then
-            SERVERS_JSON='[]'
-            SERVER_COUNT=0
-          fi
-          BATCH_LIST=$(seq 0 $((MATRIX_BATCHES - 1)) | jq -c -s '.')
-          echo "servers_json=$SERVERS_JSON" >> $GITHUB_OUTPUT
-          echo "server_count=$SERVER_COUNT" >> $GITHUB_OUTPUT
-          echo "batch_list=$BATCH_LIST" >> $GITHUB_OUTPUT
-        env:
-          COOLIFY_API_URL: ${{ secrets.COOLIFY_API_URL }}
-          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
-
   execute:
-    needs: get-servers
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        batch: ${{ fromJSON(needs.get-servers.outputs.batch_list) }}
+        batch: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
       fail-fast: false
     steps:
       - name: Setup SSH
@@ -67,11 +40,17 @@ jobs:
         run: |
           sudo apt-get install -y -qq jq >/dev/null 2>&1
           MATRIX_BATCHES=10
+          # Read the command from the event payload instead of env/interpolation
+          # so it never appears in the env block or echoed script in logs.
+          SHELL_CMD=$(jq -r '.inputs.command' "$GITHUB_EVENT_PATH")
+          echo "::add-mask::$SHELL_CMD"
+          SERVERS_JSON=$(curl -s -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
+            "$COOLIFY_API_URL/servers" 2>/dev/null | jq -c '[.[].ip]')
+          SERVER_COUNT=$(echo "$SERVERS_JSON" | jq 'length')
+          [ "$SERVER_COUNT" -eq 0 ] && exit 0
           BATCH_SIZE=$(( (SERVER_COUNT + MATRIX_BATCHES - 1) / MATRIX_BATCHES ))
           START=$((BATCH * BATCH_SIZE))
           END=$((START + BATCH_SIZE))
-          SERVERS_JSON=$(curl -s -H "Authorization: Bearer $COOLIFY_API_TOKEN" \
-            "$COOLIFY_API_URL/servers" 2>/dev/null | jq -c '[.[].ip]')
           SERVERS=$(echo "$SERVERS_JSON" | jq -r '.[]' | sed -n "$((START+1)),${END}p")
           [ -z "$SERVERS" ] && exit 0
           for SERVER_IP in $SERVERS; do
@@ -83,12 +62,10 @@ jobs:
         env:
           COOLIFY_API_URL: ${{ secrets.COOLIFY_API_URL }}
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
-          SERVER_COUNT: ${{ needs.get-servers.outputs.server_count }}
-          SHELL_CMD: ${{ inputs.command }}
           BATCH: ${{ matrix.batch }}
 
   cleanup:
-    needs: [get-servers, execute]
+    needs: execute
     runs-on: ubuntu-latest
     if: always()
     steps:
